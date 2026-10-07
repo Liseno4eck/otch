@@ -37,6 +37,7 @@ TZ = timezone(timedelta(hours=3))     # МСК
 ONLY_THAT_DAY = False                 # True = только сутки указанной даты, False = от даты и до сейчас
 TOKENS_FILE = "tokens.json"
 ACCESS_FILE = "access.json"           # кому владелец выдал доступ через /dv
+DEBUG_COUNTS = True                   # True = в конце одной строкой пишет, сколько всего найдено
 # =======================================================
 
 # Ник вида Nick_Name (допускает несколько частей: Ivan_Van_Petrov)
@@ -206,7 +207,8 @@ def count_screens(comment):
 def collect_reports(vk, start_ts, end_ts):
     """{from_id: {'nick': str|None, 'screens': int}} (в порядке от старых к новым)"""
     data = {}
-    for c in reversed(get_comments(vk, REPORT_GROUP_ID, REPORT_TOPIC_ID, start_ts, end_ts)):
+    comments = get_comments(vk, REPORT_GROUP_ID, REPORT_TOPIC_ID, start_ts, end_ts)
+    for c in reversed(comments):
         uid = c.get("from_id", 0)
         if uid <= 0:
             continue
@@ -215,11 +217,22 @@ def collect_reports(vk, start_ts, end_ts):
         if nick and not rec["nick"]:
             rec["nick"] = nick
         rec["screens"] += count_screens(c)
-    return data
+    return data, len(comments)
 
 
 def _has_header(text):
     return any(HEADER_RE.search(norm(l)) for l in (text or "").split("\n"))
+
+
+def _is_person_line(line):
+    """Строка вида '@id1 Nick_Name' / 'Nick_Name' / '[id1|Имя] — Nick': без лишних слов (названий должностей)."""
+    nick = find_nick(line)
+    if not (MENTION_RE.search(line) or nick):
+        return False
+    rest = MENTION_RE.sub(" ", line)
+    if nick:
+        rest = rest.replace(nick, " ")
+    return len(re.findall(r"[A-Za-zА-Яа-яЁё]", rest)) < 3
 
 
 def extract_people(vk, text):
@@ -231,13 +244,16 @@ def extract_people(vk, text):
         return []
     s = next((i for i in range(h, len(nl)) if FIRST_RE.search(nl[i])), h + 1)
     e = next((i for i in range(s, len(nl)) if LAST_RE.search(nl[i])), len(nl) - 1)
-    # если у последней должности ник написан на следующей строке - берём и её
-    j = e + 1
-    while j < len(lines) and not lines[j].strip():
-        j += 1
-    if (j < len(lines) and MENTION_RE.search(lines[e]) and not find_nick(lines[e])
-            and find_nick(lines[j]) and not MENTION_RE.search(lines[j])):
-        e = j
+    # под последней должностью может идти несколько людей: берём все строки, где только люди
+    j, extra = e + 1, 0
+    while j < len(lines) and extra < 40:
+        if not lines[j].strip():
+            j += 1
+            continue
+        if _is_person_line(lines[j]):
+            e, j, extra = j, j + 1, extra + 1
+        else:
+            break
 
     people = []
     pending = None          # индекс человека, у которого есть id, а ник может быть на следующей строке
@@ -315,7 +331,7 @@ def run_check(vk, my_id, peer, day, month, year):
 
     send(vk, peer, "Проверяю отчёты...")
     try:
-        reports = collect_reports(vk, start_ts, end_ts)
+        reports, n_comments = collect_reports(vk, start_ts, end_ts)
     except Exception as e:
         send(vk, peer, f"Не смог прочитать обсуждение с отчётами: {e}")
         return
@@ -329,11 +345,13 @@ def run_check(vk, my_id, peer, day, month, year):
     staff_nick = {p["id"]: p["nick"] for p in staff if p["id"] and p["nick"]}
 
     lines = ["Проверенные отчеты"]
+    shown = 0
     for uid, rec in reports.items():
         if not (staff_nick.get(uid) or rec["nick"]) and rec["screens"] == 0:
             continue                                  # не отчёт: ни ника, ни скринов
         nick = staff_nick.get(uid) or rec["nick"] or f"@id{uid}"   # id только если ника нет совсем
         lines.append(f"{nick} {rec['screens']}")
+        shown += 1
     if len(lines) == 1:
         lines.append("Отчётов за этот период нет.")
     send(vk, peer, "\n".join(lines))
@@ -368,6 +386,9 @@ def run_check(vk, my_id, peer, day, month, year):
         send(vk, peer, "Не сделаны отчеты:\n" + "\n".join(missing))
     else:
         send(vk, peer, "Не сделаны отчеты: нет, все сдали.")
+    if DEBUG_COUNTS:
+        send(vk, peer, f"Статистика: комментариев в теме отчётов {n_comments}, отчётов в списке {shown}, "
+                       f"людей в списке руководства {len(staff)}, не сдали {len(missing)}.")
 
 
 # ---------- команды страницы ----------
