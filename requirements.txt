@@ -1,0 +1,2 @@
+vk-api
+python-dotenv
