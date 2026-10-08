@@ -11,12 +11,17 @@
         4) отвечает по каждому нику:  Nick_Name есть отчет / Nick_Name нет отчета
     /dv                  - (только владелец) ответом на сообщение человека выдаёт ему доступ к /отчеты
     /undv                - (только владелец) ответом на сообщение забирает доступ
+    /restart             - (владелец и те, кому выдан доступ через /dv) полностью перезапускает бота
+Сторожевой таймер сам перезапускает бота, если он завис.
 
 pip install vk_api
 """
+import faulthandler
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -46,6 +51,9 @@ TZ = timezone(timedelta(hours=3))     # МСК
 TOKENS_FILE = "tokens.json"
 ACCESS_FILE = "access.json"           # кому владелец выдал доступ через /dv
 NICKS_FILE = "nicks.json"             # последний полученный список ников (по владельцу страницы)
+RESTART_FILE = "restart.json"         # куда написать «бот перезапущен» после /restart
+STALL_LIMIT = 150                     # сек без опроса longpoll -> сторожевой таймер перезапускает бота
+HANDLER_LIMIT = 600                   # сек выполнения одной команды -> считаем, что зависла, и перезапускаем
 # =======================================================
 
 # Ник вида Nick_Name (допускает несколько частей: Ivan_Van_Petrov)
@@ -65,12 +73,16 @@ RESERVED_REFS = {"wall", "topic", "away", "app", "album", "photo", "video", "doc
 CMD_REPORT = re.compile(r"^/отчеты\s+(\d{1,2})[./-](\d{1,2})[./-](\d{4})$")
 CMD_DV = re.compile(r"^/dv(?:\s+(\S+))?$")
 CMD_UNDV = re.compile(r"^/(?:undv|-dv)(?:\s+(\S+))?$")
+CMD_RESTART = re.compile(r"^/(?:restart|рестарт)$")
 
 page_bots = {}          # user_id -> Thread
 waiters = {}            # user_id -> ожидание ответа на /список
 lock = threading.Lock()
 access_lock = threading.Lock()
 nicks_lock = threading.Lock()
+restart_lock = threading.Lock()
+heartbeat = {}          # имя -> время последнего успешного опроса longpoll
+busy = {}               # ключ -> (время старта, команда): выполняющиеся сейчас команды
 _resolve_cache = {}
 
 
@@ -98,6 +110,7 @@ def make_session(token):
     s = vk_api.VkApi(token=token)
     s.http.mount("https://", TimeoutAdapter())
     s.http.mount("http://", TimeoutAdapter())
+    s.http.headers["Connection"] = "close"      # каждый запрос в новом соединении: нет «протухших» соединений
     return s
 
 
@@ -154,6 +167,60 @@ def save_nicks(owner_id, nicks):
         data[str(owner_id)] = {"saved": datetime.now(TZ).isoformat(timespec="seconds"),
                                "nicks": nicks}
         write_json(NICKS_FILE, data)
+
+
+# ---------- перезапуск и сторожевой таймер ----------
+def restart_process(reason):
+    """Полный перезапуск программы (бот сообщества + все страницы)."""
+    log("[restart]", reason)
+    try:
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)   # где именно всё встало
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    args = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+    if os.name == "nt":
+        subprocess.Popen(args)
+        os._exit(0)
+    os.execv(sys.executable, args)
+
+
+def mark_restart(owner_id, peer):
+    with restart_lock:
+        data = read_json(RESTART_FILE, {})
+        data[str(owner_id)] = peer
+        write_json(RESTART_FILE, data)
+
+
+def notify_restart(vk, owner_id):
+    """После перезапуска по /restart сообщает в тот же чат, что бот поднялся."""
+    with restart_lock:
+        data = read_json(RESTART_FILE, {})
+        peer = data.pop(str(owner_id), None)
+        if peer is not None:
+            write_json(RESTART_FILE, data)
+    if peer is not None:
+        try:
+            send(vk, peer, "Бот перезапущен и работает.")
+        except Exception as e:
+            log("[page] не смог написать о перезапуске:", repr(e))
+
+
+def watchdog():
+    """Если longpoll давно не опрашивался или команда висит слишком долго - перезапускаем всё."""
+    while True:
+        time.sleep(15)
+        now = time.time()
+        with lock:
+            hb = dict(heartbeat)
+            running = list(busy.values())
+        for name, t in hb.items():
+            if now - t > STALL_LIMIT:
+                restart_process(f"{name}: нет опроса longpoll {int(now - t)} сек")
+        for t, what in running:
+            if now - t > HANDLER_LIMIT:
+                restart_process(f"команда «{what}» висит {int(now - t)} сек")
 
 
 # ---------- поиск ников и пользователей ----------
@@ -400,9 +467,32 @@ def get_reply_author(vk, message_id, peer_id=None, attachments=None):
 
 
 def handle_message(vk, my_id, sender, peer, message_id, text, check_lock, attachments=None):
+    key = object()
+    with lock:
+        busy[key] = (time.time(), text[:30])
+    try:
+        _handle_message(vk, my_id, sender, peer, message_id, text, check_lock, attachments)
+    finally:
+        with lock:
+            busy.pop(key, None)
+
+
+def _handle_message(vk, my_id, sender, peer, message_id, text, check_lock, attachments=None):
     try:
         t = norm(text).strip()
         if not t.startswith("/"):
+            return
+
+        if CMD_RESTART.match(t):
+            if sender != my_id and sender not in get_access(my_id):
+                return                                # чужим не отвечаем
+            try:
+                send(vk, peer, "Перезапускаю бота...")
+            except Exception as e:
+                log("[page] /restart: не смог написать:", repr(e))
+            mark_restart(my_id, peer)
+            time.sleep(1)
+            restart_process(f"команда /restart от id{sender}")
             return
 
         grant, revoke = CMD_DV.match(t), CMD_UNDV.match(t)
@@ -427,10 +517,10 @@ def handle_message(vk, my_id, sender, peer, message_id, text, check_lock, attach
                 return
             changed = set_access(my_id, target, bool(grant))
             if grant:
-                send(vk, peer, f"Доступ к /отчеты выдан: @id{target}" if changed
+                send(vk, peer, f"Доступ к /отчеты и /restart выдан: @id{target}" if changed
                      else f"У @id{target} доступ уже есть.")
             else:
-                send(vk, peer, f"Доступ к /отчеты забран: @id{target}" if changed
+                send(vk, peer, f"Доступ к /отчеты и /restart забран: @id{target}" if changed
                      else f"У @id{target} и не было доступа.")
             return
 
@@ -448,61 +538,83 @@ def handle_message(vk, my_id, sender, peer, message_id, text, check_lock, attach
                 check_lock.release()
     except Exception as e:
         log("[page] ошибка команды:", repr(e))
+        if sender == my_id:
+            try:
+                send(vk, peer, f"Ошибка команды: {e}")
+            except Exception:
+                pass
 
 
 # ---------- страничный бот ----------
+def process_event(vk, my_id, event, seen, check_lock):
+    if event.type != VkEventType.MESSAGE_NEW:
+        return
+
+    # ответ специального сообщества на /список (входящее сообщение в его диалоге)
+    w = waiters.get(my_id)
+    if w and event.peer_id == w["peer"] and not getattr(event, "from_me", False):
+        w["ids"].append(event.message_id)
+        w["texts"].append(event.text or "")
+        w["last"] = time.time()
+        w["event"].set()
+        return
+
+    text = (event.text or "").strip()
+    if not text.startswith("/") or event.message_id in seen:
+        return
+    seen.add(event.message_id)
+    if len(seen) > 1000:
+        seen.clear()
+    # кто написал: я сам (в т.ч. «Избранное») или другой человек (личка/беседа)
+    if event.peer_id == my_id or getattr(event, "from_me", False):
+        sender = my_id
+    else:
+        sender = event.user_id
+    if not sender:
+        return
+    threading.Thread(
+        target=handle_message,
+        args=(vk, my_id, sender, event.peer_id, event.message_id, text, check_lock,
+              getattr(event, "attachments", {})),
+        daemon=True).start()
+
+
 def page_bot(token):
     check_lock = threading.Lock()
+    name = None
     while True:
         try:
             session = make_session(token)                 # только для longpoll
             vk = make_session(token).get_api()            # для команд: отдельная сессия, не мешает longpoll
             my_id = vk.users.get()[0]["id"]
+            name = f"page{my_id}"
             with lock:
                 page_bots[my_id] = threading.current_thread()
+                heartbeat[name] = time.time()
             log(f"[page] запущен для id{my_id}")
+            notify_restart(vk, my_id)
             longpoll = VkLongPoll(session)
             seen = set()
-            for event in longpoll.listen():
-                if event.type != VkEventType.MESSAGE_NEW:
-                    continue
-
-                # ответ специального сообщества на /список (входящее сообщение в его диалоге)
-                w = waiters.get(my_id)
-                if w and event.peer_id == w["peer"] and not getattr(event, "from_me", False):
-                    w["ids"].append(event.message_id)
-                    w["texts"].append(event.text or "")
-                    w["last"] = time.time()
-                    w["event"].set()
-                    continue
-
-                text = (event.text or "").strip()
-                if not text.startswith("/") or event.message_id in seen:
-                    continue
-                seen.add(event.message_id)
-                if len(seen) > 1000:
-                    seen.clear()
-                # кто написал: я сам (в т.ч. «Избранное») или другой человек (личка/беседа)
-                if event.peer_id == my_id or getattr(event, "from_me", False):
-                    sender = my_id
-                else:
-                    sender = event.user_id
-                if not sender:
-                    continue
-                threading.Thread(
-                    target=handle_message,
-                    args=(vk, my_id, sender, event.peer_id, event.message_id, text, check_lock,
-                          getattr(event, "attachments", {})),
-                    daemon=True).start()
+            while True:
+                events = longpoll.check()                 # до ~25 сек, пустой список = просто тишина
+                with lock:
+                    heartbeat[name] = time.time()
+                for event in events:
+                    try:
+                        process_event(vk, my_id, event, seen, check_lock)
+                    except Exception as e:
+                        log("[page] ошибка события:", repr(e))
         except vk_api.exceptions.ApiError as e:
             if e.code == 5:  # токен умер
                 log("[page] токен недействителен или истёк, останавливаюсь. "
                     "Получи новый токен (со scope offline) и отправь его боту: /+ТОКЕН")
+                with lock:
+                    heartbeat.pop(name, None)
                 return
             log("[page] ошибка API:", e)
             time.sleep(5)
         except Exception as e:
-            log("[page] ошибка:", e)
+            log("[page] ошибка:", repr(e))
             time.sleep(5)
 
 
@@ -551,18 +663,26 @@ def main():
         except Exception as e:
             log("не удалось поднять сохранённый токен:", e)
 
+    threading.Thread(target=watchdog, daemon=True).start()
+
     # любая ошибка здесь раньше убивала всю программу вместе со страничными ботами
     while True:
         try:
             gs = make_session(GROUP_TOKEN)
             gvk = gs.get_api()
+            with lock:
+                heartbeat["group"] = time.time()
             lp = VkBotLongPoll(gs, GROUP_ID)
             log("бот сообщества запущен")
-            for event in lp.listen():
-                try:
-                    handle_group_event(gvk, event)
-                except Exception as e:
-                    log("[group] ошибка события:", repr(e))
+            while True:
+                events = lp.check()
+                with lock:
+                    heartbeat["group"] = time.time()
+                for event in events:
+                    try:
+                        handle_group_event(gvk, event)
+                    except Exception as e:
+                        log("[group] ошибка события:", repr(e))
         except Exception as e:
             log("[group] longpoll упал, перезапуск через 5 сек:", repr(e))
             time.sleep(5)
