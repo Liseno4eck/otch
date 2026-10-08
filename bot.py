@@ -48,10 +48,11 @@ LIST_SETTLE = 3                       # ответ может прийти не�
 REQUIRE_SCREENS = False               # True = отчёт засчитывается, только если есть хотя бы 1 скрин
 
 TZ = timezone(timedelta(hours=3))     # МСК
-TOKENS_FILE = "tokens.json"
-ACCESS_FILE = "access.json"           # кому владелец выдал доступ через /dv
-NICKS_FILE = "nicks.json"             # последний полученный список ников (по владельцу страницы)
-RESTART_FILE = "restart.json"         # куда написать «бот перезапущен» после /restart
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))     # файлы лежат рядом со скриптом
+TOKENS_FILE = os.path.join(BASE_DIR, "tokens.json")
+ACCESS_FILE = os.path.join(BASE_DIR, "access.json")           # кому владелец выдал доступ через /dv
+NICKS_FILE = os.path.join(BASE_DIR, "nicks.json")             # последний полученный список ников (по владельцу страницы)
+RESTART_FILE = os.path.join(BASE_DIR, "restart.json")         # куда написать «бот перезапущен» после /restart
 STALL_LIMIT = 150                     # сек без опроса longpoll -> сторожевой таймер перезапускает бота
 HANDLER_LIMIT = 600                   # сек выполнения одной команды -> считаем, что зависла, и перезапускаем
 # =======================================================
@@ -81,6 +82,7 @@ lock = threading.Lock()
 access_lock = threading.Lock()
 nicks_lock = threading.Lock()
 restart_lock = threading.Lock()
+tokens_lock = threading.Lock()
 heartbeat = {}          # имя -> время последнего успешного опроса longpoll
 busy = {}               # ключ -> (время старта, команда): выполняющиеся сейчас команды
 _resolve_cache = {}
@@ -138,10 +140,11 @@ def load_tokens():
 
 
 def save_token(token):
-    tokens = load_tokens()
-    if token not in tokens:
-        tokens.append(token)
-        write_json(TOKENS_FILE, tokens)
+    with tokens_lock:
+        tokens = load_tokens()
+        if token not in tokens:
+            tokens.append(token)
+            write_json(TOKENS_FILE, tokens)
 
 
 def get_access(owner_id):
@@ -582,12 +585,18 @@ def process_event(vk, my_id, event, seen, check_lock):
 def page_bot(token):
     check_lock = threading.Lock()
     name = None
+    auth_fail = 0
     while True:
         try:
             session = make_session(token)                 # только для longpoll
             vk = make_session(token).get_api()            # для команд: отдельная сессия, не мешает longpoll
             my_id = vk.users.get()[0]["id"]
             name = f"page{my_id}"
+            auth_fail = 0
+            try:
+                save_token(token)                         # токен точно лежит в tokens.json и переживёт /restart
+            except Exception as e:
+                log("[page] не смог сохранить токен:", repr(e))
             with lock:
                 page_bots[my_id] = threading.current_thread()
                 heartbeat[name] = time.time()
@@ -605,12 +614,17 @@ def page_bot(token):
                     except Exception as e:
                         log("[page] ошибка события:", repr(e))
         except vk_api.exceptions.ApiError as e:
-            if e.code == 5:  # токен умер
-                log("[page] токен недействителен или истёк, останавливаюсь. "
-                    "Получи новый токен (со scope offline) и отправь его боту: /+ТОКЕН")
-                with lock:
-                    heartbeat.pop(name, None)
-                return
+            if e.code == 5:  # авторизация не прошла: сразу после перезапуска бывает временно
+                auth_fail += 1
+                if auth_fail >= 6:
+                    log("[page] токен недействителен или истёк, останавливаюсь (токен из файла НЕ удалён). "
+                        "Получи новый токен (со scope offline) и отправь его боту: /+ТОКЕН")
+                    with lock:
+                        heartbeat.pop(name, None)
+                    return
+                log(f"[page] ошибка авторизации ({auth_fail}/6), повторяю через 10 сек: {e}")
+                time.sleep(10)
+                continue
             log("[page] ошибка API:", e)
             time.sleep(5)
         except Exception as e:
@@ -657,11 +671,11 @@ def handle_group_event(gvk, event):
 
 
 def main():
-    for t in load_tokens():
-        try:
-            start_page_bot(t)
-        except Exception as e:
-            log("не удалось поднять сохранённый токен:", e)
+    tokens = list(dict.fromkeys(load_tokens()))
+    log(f"сохранённых токенов страниц: {len(tokens)}")
+    for t in tokens:
+        # не проверяем токен заранее: page_bot сам переподключается при любых сбоях сети/ВК
+        threading.Thread(target=page_bot, args=(t,), daemon=True).start()
 
     threading.Thread(target=watchdog, daemon=True).start()
 
