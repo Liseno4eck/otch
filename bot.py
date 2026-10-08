@@ -20,6 +20,7 @@ import faulthandler
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -53,6 +54,7 @@ TOKENS_FILE = os.path.join(BASE_DIR, "tokens.json")
 ACCESS_FILE = os.path.join(BASE_DIR, "access.json")           # кому владелец выдал доступ через /dv
 NICKS_FILE = os.path.join(BASE_DIR, "nicks.json")             # последний полученный список ников (по владельцу страницы)
 RESTART_FILE = os.path.join(BASE_DIR, "restart.json")         # куда написать «бот перезапущен» после /restart
+HARD_RESTART = False                  # False = /restart перезапускает всё внутри процесса (надёжно), True = запуск процесса заново
 STALL_LIMIT = 150                     # сек без опроса longpoll -> сторожевой таймер перезапускает бота
 HANDLER_LIMIT = 600                   # сек выполнения одной команды -> считаем, что зависла, и перезапускаем
 # =======================================================
@@ -83,6 +85,7 @@ access_lock = threading.Lock()
 nicks_lock = threading.Lock()
 restart_lock = threading.Lock()
 tokens_lock = threading.Lock()
+generation = 0           # номер «поколения»: при перезапуске старые потоки сами завершаются
 heartbeat = {}          # имя -> время последнего успешного опроса longpoll
 busy = {}               # ключ -> (время старта, команда): выполняющиеся сейчас команды
 _resolve_cache = {}
@@ -173,8 +176,19 @@ def save_nicks(owner_id, nicks):
 
 
 # ---------- перезапуск и сторожевой таймер ----------
-def restart_process(reason):
-    """Полный перезапуск программы (бот сообщества + все страницы)."""
+def migrate_files():
+    """Файлы раньше лежали в текущей папке, теперь рядом со скриптом: переносим, чтобы ничего не потерять."""
+    for p in (TOKENS_FILE, ACCESS_FILE, NICKS_FILE):
+        old = os.path.join(os.getcwd(), os.path.basename(p))
+        if os.path.abspath(old) != os.path.abspath(p) and os.path.exists(old) and not os.path.exists(p):
+            try:
+                shutil.copy(old, p)
+                log(f"[файл] перенёс {old} -> {p}")
+            except Exception as e:
+                log("[файл] не смог перенести", old, repr(e))
+
+
+def dump_state(reason):
     log("[restart]", reason)
     try:
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)   # где именно всё встало
@@ -182,6 +196,33 @@ def restart_process(reason):
         sys.stderr.flush()
     except Exception:
         pass
+
+
+def soft_restart(reason):
+    """Перезапуск ВСЕГО внутри процесса: новые сессии, потоки, замки. Старые (в т.ч. зависшие) потоки
+    получают устаревший номер поколения и завершаются/игнорируются. Процесс не умирает, токены не теряются."""
+    global generation
+    dump_state(reason)
+    with lock:
+        generation += 1
+        heartbeat.clear()
+        busy.clear()
+        waiters.clear()
+        page_bots.clear()
+    _resolve_cache.clear()
+    start_all()
+
+
+def restart_process(reason):
+    if HARD_RESTART:
+        hard_restart(reason)
+    else:
+        soft_restart(reason)
+
+
+def hard_restart(reason):
+    """Запуск процесса заново (может не работать в IDE/на хостингах, поэтому по умолчанию выключено)."""
+    dump_state(reason)
     args = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
     if os.name == "nt":
         subprocess.Popen(args)
@@ -582,11 +623,13 @@ def process_event(vk, my_id, event, seen, check_lock):
         daemon=True).start()
 
 
-def page_bot(token):
+def page_bot(token, gen):
     check_lock = threading.Lock()
     name = None
     auth_fail = 0
     while True:
+        if gen != generation:
+            return                                    # был перезапуск: этот поток устарел
         try:
             session = make_session(token)                 # только для longpoll
             vk = make_session(token).get_api()            # для команд: отдельная сессия, не мешает longpoll
@@ -606,6 +649,8 @@ def page_bot(token):
             seen = set()
             while True:
                 events = longpoll.check()                 # до ~25 сек, пустой список = просто тишина
+                if gen != generation:
+                    return                                # события уже получит новый поток
                 with lock:
                     heartbeat[name] = time.time()
                 for event in events:
@@ -638,7 +683,7 @@ def start_page_bot(token):
     with lock:
         if uid in page_bots and page_bots[uid].is_alive():
             return uid, False
-    threading.Thread(target=page_bot, args=(token,), daemon=True).start()
+    threading.Thread(target=page_bot, args=(token, generation), daemon=True).start()
     return uid, True
 
 
@@ -670,17 +715,9 @@ def handle_group_event(gvk, event):
     gvk.messages.send(peer_id=peer, random_id=0, message=answer)
 
 
-def main():
-    tokens = list(dict.fromkeys(load_tokens()))
-    log(f"сохранённых токенов страниц: {len(tokens)}")
-    for t in tokens:
-        # не проверяем токен заранее: page_bot сам переподключается при любых сбоях сети/ВК
-        threading.Thread(target=page_bot, args=(t,), daemon=True).start()
-
-    threading.Thread(target=watchdog, daemon=True).start()
-
+def group_bot(gen):
     # любая ошибка здесь раньше убивала всю программу вместе со страничными ботами
-    while True:
+    while gen == generation:
         try:
             gs = make_session(GROUP_TOKEN)
             gvk = gs.get_api()
@@ -690,6 +727,8 @@ def main():
             log("бот сообщества запущен")
             while True:
                 events = lp.check()
+                if gen != generation:
+                    return
                 with lock:
                     heartbeat["group"] = time.time()
                 for event in events:
@@ -700,6 +739,25 @@ def main():
         except Exception as e:
             log("[group] longpoll упал, перезапуск через 5 сек:", repr(e))
             time.sleep(5)
+
+
+def start_all():
+    """Запускает бота сообщества и все сохранённые страницы текущего поколения."""
+    gen = generation
+    tokens = list(dict.fromkeys(load_tokens()))
+    log(f"сохранённых токенов страниц: {len(tokens)}")
+    for t in tokens:
+        # не проверяем токен заранее: page_bot сам переподключается при любых сбоях сети/ВК
+        threading.Thread(target=page_bot, args=(t, gen), daemon=True).start()
+    threading.Thread(target=group_bot, args=(gen,), daemon=True).start()
+
+
+def main():
+    migrate_files()
+    threading.Thread(target=watchdog, daemon=True).start()
+    start_all()
+    while True:                      # основной поток просто живёт; всё работает в потоках
+        time.sleep(3600)
 
 
 if __name__ == "__main__":
