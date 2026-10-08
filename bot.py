@@ -22,6 +22,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 import vk_api
+from requests.adapters import HTTPAdapter
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.longpoll import VkLongPoll, VkEventType
 
@@ -82,60 +83,77 @@ def norm(s):
     return (s or "").replace("\xa0", " ").replace("\u200b", "").lower().replace("ё", "е")
 
 
-# ---------- файлы ----------
-def load_tokens():
-    if os.path.exists(TOKENS_FILE):
-        with open(TOKENS_FILE, encoding="utf-8") as f:
+# ---------- сеть и файлы ----------
+class TimeoutAdapter(HTTPAdapter):
+    """vk_api по умолчанию ходит БЕЗ таймаута: один зависший запрос держит внутреннюю
+    блокировку vk_api, и все остальные запросы бота встают навсегда. Ставим таймаут."""
+
+    def send(self, request, **kwargs):
+        if not kwargs.get("timeout"):
+            kwargs["timeout"] = (10, 30)
+        return super().send(request, **kwargs)
+
+
+def make_session(token):
+    s = vk_api.VkApi(token=token)
+    s.http.mount("https://", TimeoutAdapter())
+    s.http.mount("http://", TimeoutAdapter())
+    return s
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
-    return []
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        log(f"[файл] {path} повреждён ({e!r}), беру пустые данные")
+        return default
+
+
+def write_json(path, data):
+    """Атомарная запись: сначала во временный файл, потом подмена (файл не бьётся при сбое)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def load_tokens():
+    return read_json(TOKENS_FILE, [])
 
 
 def save_token(token):
     tokens = load_tokens()
     if token not in tokens:
         tokens.append(token)
-        with open(TOKENS_FILE, "w", encoding="utf-8") as f:
-            json.dump(tokens, f)
-
-
-def _load_access():
-    if os.path.exists(ACCESS_FILE):
-        with open(ACCESS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+        write_json(TOKENS_FILE, tokens)
 
 
 def get_access(owner_id):
     with access_lock:
-        return set(_load_access().get(str(owner_id), []))
+        return set(read_json(ACCESS_FILE, {}).get(str(owner_id), []))
 
 
 def set_access(owner_id, user_id, grant):
     with access_lock:
-        data = _load_access()
+        data = read_json(ACCESS_FILE, {})
         users = set(data.get(str(owner_id), []))
         before = set(users)
         (users.add if grant else users.discard)(user_id)
         data[str(owner_id)] = sorted(users)
-        with open(ACCESS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        write_json(ACCESS_FILE, data)
         return users != before
 
 
 def save_nicks(owner_id, nicks):
     """Запоминаем последний полученный список ников."""
     with nicks_lock:
-        data = {}
-        if os.path.exists(NICKS_FILE):
-            try:
-                with open(NICKS_FILE, encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
+        data = read_json(NICKS_FILE, {})
         data[str(owner_id)] = {"saved": datetime.now(TZ).isoformat(timespec="seconds"),
                                "nicks": nicks}
-        with open(NICKS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
+        write_json(NICKS_FILE, data)
 
 
 # ---------- поиск ников и пользователей ----------
@@ -437,8 +455,8 @@ def page_bot(token):
     check_lock = threading.Lock()
     while True:
         try:
-            session = vk_api.VkApi(token=token)
-            vk = session.get_api()
+            session = make_session(token)                 # только для longpoll
+            vk = make_session(token).get_api()            # для команд: отдельная сессия, не мешает longpoll
             my_id = vk.users.get()[0]["id"]
             with lock:
                 page_bots[my_id] = threading.current_thread()
@@ -478,7 +496,8 @@ def page_bot(token):
                     daemon=True).start()
         except vk_api.exceptions.ApiError as e:
             if e.code == 5:  # токен умер
-                log("[page] токен недействителен, останавливаюсь")
+                log("[page] токен недействителен или истёк, останавливаюсь. "
+                    "Получи новый токен (со scope offline) и отправь его боту: /+ТОКЕН")
                 return
             log("[page] ошибка API:", e)
             time.sleep(5)
@@ -488,7 +507,7 @@ def page_bot(token):
 
 
 def start_page_bot(token):
-    vk = vk_api.VkApi(token=token).get_api()
+    vk = make_session(token).get_api()
     uid = vk.users.get()[0]["id"]          # проверка токена
     with lock:
         if uid in page_bots and page_bots[uid].is_alive():
@@ -498,6 +517,33 @@ def start_page_bot(token):
 
 
 # ---------- бот сообщества ----------
+def handle_group_event(gvk, event):
+    if event.type != VkBotEventType.MESSAGE_NEW:
+        return
+    msg = event.obj.message
+    text = (msg.get("text") or "").strip()
+    peer = msg["peer_id"]
+    if not text.startswith("/+"):
+        return
+    token = text[2:].strip()
+    if not token:
+        gvk.messages.send(peer_id=peer, random_id=0, message="Использование: /+ТОКЕН")
+        return
+    # удаляем сообщение с токеном
+    try:
+        gvk.messages.delete(peer_id=peer, cmids=msg["conversation_message_id"], delete_for_all=1)
+    except Exception:
+        pass
+    try:
+        page_id, started = start_page_bot(token)
+        save_token(token)
+        answer = (f"Страница id{page_id} подключена. Команды работают в любом чате: /отчеты ДД.ММ.ГГГГ"
+                  if started else f"Страница id{page_id} уже подключена.")
+    except Exception as e:
+        answer = f"Не удалось подключить токен: {e}"
+    gvk.messages.send(peer_id=peer, random_id=0, message=answer)
+
+
 def main():
     for t in load_tokens():
         try:
@@ -505,36 +551,21 @@ def main():
         except Exception as e:
             log("не удалось поднять сохранённый токен:", e)
 
-    gs = vk_api.VkApi(token=GROUP_TOKEN)
-    gvk = gs.get_api()
-    lp = VkBotLongPoll(gs, GROUP_ID)
-    log("бот сообщества запущен")
-
-    for event in lp.listen():
-        if event.type != VkBotEventType.MESSAGE_NEW:
-            continue
-        msg = event.obj.message
-        text = (msg.get("text") or "").strip()
-        peer = msg["peer_id"]
-        if not text.startswith("/+"):
-            continue
-        token = text[2:].strip()
-        if not token:
-            gvk.messages.send(peer_id=peer, random_id=0, message="Использование: /+ТОКЕН")
-            continue
-        # удаляем сообщение с токеном
+    # любая ошибка здесь раньше убивала всю программу вместе со страничными ботами
+    while True:
         try:
-            gvk.messages.delete(peer_id=peer, cmids=msg["conversation_message_id"], delete_for_all=1)
-        except Exception:
-            pass
-        try:
-            page_id, started = start_page_bot(token)
-            save_token(token)
-            answer = (f"Страница id{page_id} подключена. Команды работают в любом чате: /отчеты ДД.ММ.ГГГГ"
-                      if started else f"Страница id{page_id} уже подключена.")
+            gs = make_session(GROUP_TOKEN)
+            gvk = gs.get_api()
+            lp = VkBotLongPoll(gs, GROUP_ID)
+            log("бот сообщества запущен")
+            for event in lp.listen():
+                try:
+                    handle_group_event(gvk, event)
+                except Exception as e:
+                    log("[group] ошибка события:", repr(e))
         except Exception as e:
-            answer = f"Не удалось подключить токен: {e}"
-        gvk.messages.send(peer_id=peer, random_id=0, message=answer)
+            log("[group] longpoll упал, перезапуск через 5 сек:", repr(e))
+            time.sleep(5)
 
 
 if __name__ == "__main__":
