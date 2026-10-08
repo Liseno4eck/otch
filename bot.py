@@ -347,22 +347,41 @@ def run_check(vk, my_id, peer, day, month, year):
 
 
 # ---------- команды страницы ----------
-def get_reply_author(vk, message_id):
-    """Автор сообщения, на которое ответили командой."""
+def get_reply_author(vk, message_id, peer_id=None, attachments=None):
+    """Автор сообщения, на которое ответили командой (два способа + лог)."""
     time.sleep(0.5)
-    r = vk.messages.getById(message_ids=message_id)
-    items = r.get("items") if isinstance(r, dict) else r
-    if not items:
-        return None
-    m = items[0]
-    if m.get("reply_message"):
-        return m["reply_message"].get("from_id")
-    if m.get("fwd_messages"):
-        return m["fwd_messages"][0].get("from_id")
+    # способ 1: само сообщение с командой содержит reply_message / fwd_messages
+    try:
+        r = vk.messages.getById(message_ids=message_id)
+        items = r.get("items") if isinstance(r, dict) else r
+        if items:
+            m = items[0]
+            if m.get("reply_message"):
+                return m["reply_message"].get("from_id")
+            if m.get("fwd_messages"):
+                return m["fwd_messages"][0].get("from_id")
+        log("[page] /dv: в сообщении нет reply_message/fwd_messages")
+    except Exception as e:
+        log("[page] /dv getById:", repr(e))
+    # способ 2: longpoll отдаёт ссылку на ответ (conversation_message_id) в attachments["reply"]
+    try:
+        reply = (attachments or {}).get("reply")
+        if reply and peer_id:
+            cmid = json.loads(reply).get("conversation_message_id")
+            if cmid:
+                r = vk.messages.getByConversationMessageId(
+                    peer_id=peer_id, conversation_message_ids=cmid)
+                items = r.get("items") if isinstance(r, dict) else r
+                if items:
+                    return items[0].get("from_id")
+        else:
+            log("[page] /dv: longpoll не передал reply, attachments =", attachments)
+    except Exception as e:
+        log("[page] /dv getByConversationMessageId:", repr(e))
     return None
 
 
-def handle_message(vk, my_id, sender, peer, message_id, text, check_lock):
+def handle_message(vk, my_id, sender, peer, message_id, text, check_lock, attachments=None):
     try:
         t = norm(text).strip()
         if not t.startswith("/"):
@@ -371,13 +390,15 @@ def handle_message(vk, my_id, sender, peer, message_id, text, check_lock):
         grant, revoke = CMD_DV.match(t), CMD_UNDV.match(t)
         if grant or revoke:
             if sender != my_id:                       # выдавать доступ может только владелец
+                log(f"[page] /dv/undv проигнорирован: sender={sender}, владелец={my_id}")
                 return
             arg = (grant or revoke).group(1)
             target = None
             try:
-                target = get_reply_author(vk, message_id)
+                target = get_reply_author(vk, message_id, peer, attachments)
             except Exception as e:
-                log("[page] getById:", e)
+                log("[page] /dv ошибка:", repr(e))
+            log(f"[page] /dv: sender={sender}, peer={peer}, target={target}")
             if not target and arg:
                 target = ref_to_id(vk, arg)
             if not target or target < 0:
@@ -452,7 +473,8 @@ def page_bot(token):
                     continue
                 threading.Thread(
                     target=handle_message,
-                    args=(vk, my_id, sender, event.peer_id, event.message_id, text, check_lock),
+                    args=(vk, my_id, sender, event.peer_id, event.message_id, text, check_lock,
+                          getattr(event, "attachments", {})),
                     daemon=True).start()
         except vk_api.exceptions.ApiError as e:
             if e.code == 5:  # токен умер
