@@ -4,7 +4,11 @@
 
 Сообщество:  /+ТОКЕН  -> подключает страницу (запускает страничного бота). Доступно всем.
 Страница (работает В ЛЮБОМ ЧАТЕ, где она состоит):
-    /отчеты ДД.ММ.ГГГГ   - проверка отчётов (владелец страницы и те, кому выдан доступ)
+    /отчеты ДД.ММ.ГГГГ   - (владелец страницы и те, кому выдан доступ)
+        1) страница пишет /список в специальное сообщество (LIST_GROUP_ID)
+        2) ждёт ответ со списком ников и запоминает их (nicks.json)
+        3) проверяет обсуждение с отчётами СТРОГО за указанную дату (сутки по МСК)
+        4) отвечает по каждому нику:  Nick_Name есть отчет / Nick_Name нет отчета
     /dv                  - (только владелец) ответом на сообщение человека выдаёт ему доступ к /отчеты
     /undv                - (только владелец) ответом на сообщение забирает доступ
 
@@ -22,22 +26,25 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.longpoll import VkLongPoll, VkEventType
 
 # ====================== НАСТРОЙКИ ======================
-GROUP_TOKEN = "vk1.a.GHSx09IglDrPEe0qC9T-1nRO4OZNX-SrTfzERQa6PSDjwgufKrrSile-Gh38kKSloZGNlxe0YdxRcJnAphHlaUXvMLQDZv9hcRqo5fYQHZVUjYf1YTUZND0xhB8H-oFkYRSlgoyg5O0PQfFD08LjYSqImG8m55jFrZFr0KNtiJtQjHcNQhJ-Rp5ftrmMgWEa728Au7N9V9_SymC5ti-xcw"      # токен бота-сообщества (с правом сообщений)
+GROUP_TOKEN = "vk1.a.GHSx09IglDrPEe0qC9T-1nRO4OZNX-SrTfzERQa6PSDjwgufKrrSile-Gh38kKSloZGNlxe0YdxRcJnAphHlaUXvMLQDZv9hcRqo5fYQHZVUjYf1YTUZND0xhB8H-oFkYRSlgoyg5O0PQfFD08LjYSqImG8m55jFrZFr0KNtiJtQjHcNQhJ-Rp5ftrmMgWEa728Au7N9V9_SymC5ti-xcw"   # токен бота-сообщества (с правом сообщений)
 GROUP_ID = 242102423                  # id сообщества-бота (без минуса)
 
 # Сообщество и обсуждение, где лежат ОТЧЁТЫ
 REPORT_GROUP_ID = 221245909           # без минуса
 REPORT_TOPIC_ID = 56568576
 
-# Сообщество и обсуждение, где лежит "Руководящая администрация"
-STAFF_GROUP_ID = 222972502            # без минуса
-STAFF_TOPIC_ID = 50373987
+# Специальное сообщество, которому страница пишет /список и от которого ждёт ответ с никами
+LIST_GROUP_ID = 241841230                     # <-- ВПИШИ id этого сообщества (без минуса)
+LIST_COMMAND = "/список"
+LIST_WAIT = 30                        # сколько секунд ждать ответ на /список
+LIST_SETTLE = 3                       # ответ может прийти несколькими сообщениями: ждём тишину столько секунд
+
+REQUIRE_SCREENS = False               # True = отчёт засчитывается, только если есть хотя бы 1 скрин
 
 TZ = timezone(timedelta(hours=3))     # МСК
-ONLY_THAT_DAY = False                 # True = только сутки указанной даты, False = от даты и до сейчас
 TOKENS_FILE = "tokens.json"
 ACCESS_FILE = "access.json"           # кому владелец выдал доступ через /dv
-DEBUG_COUNTS = True                   # True = в конце одной строкой пишет, сколько всего найдено
+NICKS_FILE = "nicks.json"             # последний полученный список ников (по владельцу страницы)
 # =======================================================
 
 # Ник вида Nick_Name (допускает несколько частей: Ivan_Van_Petrov)
@@ -54,17 +61,15 @@ MENTION_RE = re.compile(
 RESERVED_REFS = {"wall", "topic", "away", "app", "album", "photo", "video", "doc",
                  "market", "all", "online", "everyone", "here"}
 
-HEADER_RE = re.compile(r"руководящ\w*\s+администрац\w*")
-FIRST_RE = re.compile(r"\bзам\w*\.?\s+основател\w*")                 # Заместитель / Зам. основателя
-LAST_RE = re.compile(r"\b(?:помощник\w*|пом)\.?\s+основател\w*")     # Помощник основателя
-
 CMD_REPORT = re.compile(r"^/отчеты\s+(\d{1,2})[./-](\d{1,2})[./-](\d{4})$")
 CMD_DV = re.compile(r"^/dv(?:\s+(\S+))?$")
 CMD_UNDV = re.compile(r"^/(?:undv|-dv)(?:\s+(\S+))?$")
 
 page_bots = {}          # user_id -> Thread
+waiters = {}            # user_id -> ожидание ответа на /список
 lock = threading.Lock()
 access_lock = threading.Lock()
+nicks_lock = threading.Lock()
 _resolve_cache = {}
 
 
@@ -117,6 +122,22 @@ def set_access(owner_id, user_id, grant):
         return users != before
 
 
+def save_nicks(owner_id, nicks):
+    """Запоминаем последний полученный список ников."""
+    with nicks_lock:
+        data = {}
+        if os.path.exists(NICKS_FILE):
+            try:
+                with open(NICKS_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        data[str(owner_id)] = {"saved": datetime.now(TZ).isoformat(timespec="seconds"),
+                               "nicks": nicks}
+        with open(NICKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+
+
 # ---------- поиск ников и пользователей ----------
 def find_nick(text):
     # ссылки и упоминания (vk.com/anna_s, [id1|Имя]) не считаем никами
@@ -139,6 +160,19 @@ def find_nick(text):
     if m:
         return f"{m.group(1)}_{m.group(2)}"
     return None
+
+
+def parse_nick_list(text):
+    """Все ники Nick_Name из ответа на /список (без повторов, в исходном порядке)."""
+    text = (text or "").replace("<br>", "\n")
+    text = MENTION_RE.sub(" ", text)
+    seen, result = set(), []
+    for m in NICK_RE.finditer(text):
+        nick = m.group(0)
+        if nick.lower() not in seen:
+            seen.add(nick.lower())
+            result.append(nick)
+    return result
 
 
 def resolve_user(vk, ref):
@@ -171,7 +205,7 @@ def ref_to_id(vk, s):
 
 # ---------- работа с обсуждениями ----------
 def get_comments(vk, group_id, topic_id, since_ts=None, until_ts=None):
-    """Комментарии обсуждения (новые -> старые), отсекая по времени."""
+    """Комментарии обсуждения (новые -> старые), отсекая по времени: since_ts <= date < until_ts."""
     result, offset = [], 0
     while True:
         r = vk.board.getComments(group_id=group_id, topic_id=topic_id,
@@ -205,106 +239,19 @@ def count_screens(comment):
 
 
 def collect_reports(vk, start_ts, end_ts):
-    """{from_id: {'nick': str|None, 'screens': int}} (в порядке от старых к новым)"""
+    """{from_id: {'nicks': set(нижний регистр), 'screens': int}} за [start_ts, end_ts)"""
     data = {}
     comments = get_comments(vk, REPORT_GROUP_ID, REPORT_TOPIC_ID, start_ts, end_ts)
     for c in reversed(comments):
         uid = c.get("from_id", 0)
         if uid <= 0:
             continue
-        rec = data.setdefault(uid, {"nick": None, "screens": 0})
+        rec = data.setdefault(uid, {"nicks": set(), "screens": 0})
         nick = find_nick(c.get("text", ""))
-        if nick and not rec["nick"]:
-            rec["nick"] = nick
+        if nick:
+            rec["nicks"].add(nick.lower())
         rec["screens"] += count_screens(c)
     return data, len(comments)
-
-
-def _has_header(text):
-    return any(HEADER_RE.search(norm(l)) for l in (text or "").split("\n"))
-
-
-def _is_person_line(line):
-    """Строка вида '@id1 Nick_Name' / 'Nick_Name' / '[id1|Имя] — Nick': без лишних слов (названий должностей)."""
-    nick = find_nick(line)
-    if not (MENTION_RE.search(line) or nick):
-        return False
-    rest = MENTION_RE.sub(" ", line)
-    if nick:
-        rest = rest.replace(nick, " ")
-    return len(re.findall(r"[A-Za-zА-Яа-яЁё]", rest)) < 3
-
-
-def extract_people(vk, text):
-    """Из текста берёт людей от 'Заместитель основателя' до 'Помощник основателя' после заголовка."""
-    lines = (text or "").replace("\r", "").split("\n")
-    nl = [norm(l) for l in lines]
-    h = next((i for i, l in enumerate(nl) if HEADER_RE.search(l)), None)
-    if h is None:
-        return []
-    s = next((i for i in range(h, len(nl)) if FIRST_RE.search(nl[i])), h + 1)
-    e = next((i for i in range(s, len(nl)) if LAST_RE.search(nl[i])), len(nl) - 1)
-    # под последней должностью может идти несколько людей: берём все строки, где только люди
-    j, extra = e + 1, 0
-    while j < len(lines) and extra < 40:
-        if not lines[j].strip():
-            j += 1
-            continue
-        if _is_person_line(lines[j]):
-            e, j, extra = j, j + 1, extra + 1
-        else:
-            break
-
-    people = []
-    pending = None          # индекс человека, у которого есть id, а ник может быть на следующей строке
-    for line in lines[s:e + 1]:
-        ids = []
-        for m in MENTION_RE.finditer(line):
-            ref = next(g for g in m.groups() if g)
-            uid = resolve_user(vk, ref)
-            if uid and uid not in ids:
-                ids.append(uid)
-        nick = find_nick(line)
-        if ids:
-            for uid in ids:
-                people.append({"id": uid, "nick": nick if len(ids) == 1 else None})
-            pending = len(people) - 1 if (len(ids) == 1 and not nick) else None
-        elif nick:
-            if pending is not None:
-                people[pending]["nick"] = nick      # "@id123" и "Nick_Name" на разных строках
-                pending = None
-            else:
-                people.append({"id": None, "nick": nick})
-    return people
-
-
-def parse_staff(vk):
-    """-> (people, info). info: сколько комментариев просмотрено, найден ли заголовок, кусок текста."""
-    comments = get_comments(vk, STAFF_GROUP_ID, STAFF_TOPIC_ID)      # новые -> старые
-    info = {"scanned": len(comments), "header": False, "snippet": ""}
-    for i, c in enumerate(comments):
-        text = c.get("text", "")
-        if not _has_header(text):
-            continue
-        info["header"] = True
-        info["snippet"] = text[:400]
-        people = extract_people(vk, text)
-        if not people:
-            # список мог быть написан следующими комментариями того же автора
-            tail, j = text, i - 1
-            while j >= 0 and i - j <= 10 and comments[j].get("from_id") == c.get("from_id"):
-                tail += "\n" + comments[j].get("text", "")
-                j -= 1
-            people = extract_people(vk, tail)
-        if people:
-            seen, uniq = set(), []
-            for p in people:
-                key = p["id"] or (p["nick"] or "").lower()
-                if key not in seen:
-                    seen.add(key)
-                    uniq.append(p)
-            return uniq, info
-    return [], info
 
 
 # ---------- сообщения ----------
@@ -320,75 +267,83 @@ def send(vk, peer_id, text):
         time.sleep(0.4)
 
 
+def request_nick_list(vk, my_id):
+    """Пишет /список в специальное сообщество и ждёт ответ. -> текст ответа или None (не дождались)."""
+    peer_list = -LIST_GROUP_ID
+    w = {"peer": peer_list, "ids": [], "texts": [], "last": 0.0, "event": threading.Event()}
+    with lock:
+        waiters[my_id] = w
+    try:
+        vk.messages.send(peer_id=peer_list, random_id=0, message=LIST_COMMAND)
+        if not w["event"].wait(LIST_WAIT):
+            return None
+        # ответ мог прийти несколькими сообщениями: ждём, пока всё придёт
+        while time.time() - w["last"] < LIST_SETTLE:
+            time.sleep(0.5)
+        ids, texts = list(w["ids"]), list(w["texts"])
+    finally:
+        with lock:
+            waiters.pop(my_id, None)
+
+    # longpoll может обрезать длинный текст, поэтому берём полные сообщения через API
+    try:
+        r = vk.messages.getById(message_ids=",".join(map(str, ids)))
+        items = r.get("items") if isinstance(r, dict) else r
+        if items:
+            items = sorted(items, key=lambda m: m.get("id", 0))
+            return "\n".join(m.get("text", "") for m in items)
+    except Exception as e:
+        log("[page] getById (список):", e)
+    return "\n".join(texts)
+
+
 def run_check(vk, my_id, peer, day, month, year):
     try:
         start = datetime(year, month, day, tzinfo=TZ)
     except ValueError:
         send(vk, peer, "Неверная дата. Формат: /отчеты ДД.ММ.ГГГГ")
         return
+    if not LIST_GROUP_ID:
+        send(vk, peer, "В коде не указан LIST_GROUP_ID (сообщество, у которого запрашивается /список).")
+        return
     start_ts = int(start.timestamp())
-    end_ts = int((start + timedelta(days=1)).timestamp()) if ONLY_THAT_DAY else None
+    end_ts = int((start + timedelta(days=1)).timestamp())      # строго сутки указанной даты
 
-    send(vk, peer, "Проверяю отчёты...")
+    # 1) спрашиваем список ников
+    send(vk, peer, "Запрашиваю список...")
     try:
-        reports, n_comments = collect_reports(vk, start_ts, end_ts)
+        answer = request_nick_list(vk, my_id)
+    except Exception as e:
+        send(vk, peer, f"Не смог написать в сообщество со списком: {e}")
+        return
+    if answer is None:
+        send(vk, peer, f"Ответ на {LIST_COMMAND} не пришёл за {LIST_WAIT} сек.")
+        return
+
+    # 2) запоминаем ники
+    nicks = parse_nick_list(answer)
+    if not nicks:
+        send(vk, peer, "В ответе на /список не нашёл ни одного ника вида Nick_Name.")
+        return
+    save_nicks(my_id, nicks)
+
+    # 3) проверяем отчёты за эту дату
+    send(vk, peer, f"Получил ников: {len(nicks)}. Проверяю отчёты за {day:02d}.{month:02d}.{year}...")
+    try:
+        reports, _ = collect_reports(vk, start_ts, end_ts)
     except Exception as e:
         send(vk, peer, f"Не смог прочитать обсуждение с отчётами: {e}")
         return
 
-    # список руководства нужен и для «настоящих» ников, и для списка не сдавших
-    staff, info, staff_err = [], None, None
-    try:
-        staff, info = parse_staff(vk)
-    except Exception as e:
-        staff_err = e
-    staff_nick = {p["id"]: p["nick"] for p in staff if p["id"] and p["nick"]}
+    have = set()
+    for rec in reports.values():
+        if REQUIRE_SCREENS and rec["screens"] == 0:
+            continue
+        have |= rec["nicks"]
 
-    lines = ["Проверенные отчеты"]
-    shown = 0
-    for uid, rec in reports.items():
-        if not (staff_nick.get(uid) or rec["nick"]) and rec["screens"] == 0:
-            continue                                  # не отчёт: ни ника, ни скринов
-        nick = staff_nick.get(uid) or rec["nick"] or f"@id{uid}"   # id только если ника нет совсем
-        lines.append(f"{nick} {rec['screens']}")
-        shown += 1
-    if len(lines) == 1:
-        lines.append("Отчётов за этот период нет.")
+    # 4) результат
+    lines = [f"{n} есть отчет" if n.lower() in have else f"{n} нет отчета" for n in nicks]
     send(vk, peer, "\n".join(lines))
-
-    if staff_err:
-        send(vk, peer, f"Не смог прочитать обсуждение руководства: {staff_err}")
-        return
-    if not staff:
-        if info["scanned"] == 0:
-            msg = (f"Обсуждение руководства пустое или недоступно (группа {STAFF_GROUP_ID}, "
-                   f"тема {STAFF_TOPIC_ID}). Проверь id и что страница состоит в сообществе.")
-        elif not info["header"]:
-            msg = (f"Просмотрел {info['scanned']} комментариев, строку «Руководящая администрация» "
-                   f"не нашёл. Проверь STAFF_GROUP_ID / STAFF_TOPIC_ID.")
-        else:
-            msg = ("Строку «Руководящая администрация» нашёл, но людей под ней не распознал. "
-                   "Начало текста:\n" + info["snippet"])
-        send(vk, peer, msg)
-        return
-
-    done_ids = set(reports)
-    done_nicks = {r["nick"].lower() for r in reports.values() if r["nick"]}
-    done_nicks |= {staff_nick[u].lower() for u in reports if u in staff_nick}
-    missing = []
-    for p in staff:
-        if p["id"] in done_ids:
-            continue
-        if p["nick"] and p["nick"].lower() in done_nicks:
-            continue
-        missing.append(p["nick"] or f"@id{p['id']}")               # id только если ника нет
-    if missing:
-        send(vk, peer, "Не сделаны отчеты:\n" + "\n".join(missing))
-    else:
-        send(vk, peer, "Не сделаны отчеты: нет, все сдали.")
-    if DEBUG_COUNTS:
-        send(vk, peer, f"Статистика: комментариев в теме отчётов {n_comments}, отчётов в списке {shown}, "
-                       f"людей в списке руководства {len(staff)}, не сдали {len(missing)}.")
 
 
 # ---------- команды страницы ----------
@@ -472,6 +427,16 @@ def page_bot(token):
             for event in longpoll.listen():
                 if event.type != VkEventType.MESSAGE_NEW:
                     continue
+
+                # ответ специального сообщества на /список (входящее сообщение в его диалоге)
+                w = waiters.get(my_id)
+                if w and event.peer_id == w["peer"] and not getattr(event, "from_me", False):
+                    w["ids"].append(event.message_id)
+                    w["texts"].append(event.text or "")
+                    w["last"] = time.time()
+                    w["event"].set()
+                    continue
+
                 text = (event.text or "").strip()
                 if not text.startswith("/") or event.message_id in seen:
                     continue
