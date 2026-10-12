@@ -8,7 +8,8 @@
         1) страница пишет /список в специальное сообщество (LIST_GROUP_ID)
         2) ждёт ответ со списком ников и запоминает их (nicks.json)
         3) проверяет обсуждение с отчётами СТРОГО за указанную дату (сутки по МСК)
-        4) отвечает по каждому нику:  Nick_Name есть отчет / Nick_Name нет отчета
+        4) ники ищутся «по сути»: без _, без учёта регистра, с мелкими опечатками
+        5) отвечает по каждому нику:  Nick_Name есть отчет / Nick_Name нет отчета
     /dv                  - (только владелец) ответом на сообщение человека выдаёт ему доступ к /отчеты
     /undv                - (только владелец) ответом на сообщение забирает доступ
     /restart             - (владелец и те, кому выдан доступ через /dv) полностью перезапускает бота
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
 
 import vk_api
 from requests.adapters import HTTPAdapter
@@ -33,7 +35,8 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.longpoll import VkLongPoll, VkEventType
 
 # ====================== НАСТРОЙКИ ======================
-GROUP_TOKEN = "vk1.a.GHSx09IglDrPEe0qC9T-1nRO4OZNX-SrTfzERQa6PSDjwgufKrrSile-Gh38kKSloZGNlxe0YdxRcJnAphHlaUXvMLQDZv9hcRqo5fYQHZVUjYf1YTUZND0xhB8H-oFkYRSlgoyg5O0PQfFD08LjYSqImG8m55jFrZFr0KNtiJtQjHcNQhJ-Rp5ftrmMgWEa728Au7N9V9_SymC5ti-xcw"   # токен бота-сообщества (с правом сообщений)
+# Токен лучше хранить в переменной окружения GROUP_TOKEN (или вписать сюда НОВЫЙ токен)
+GROUP_TOKEN = os.environ.get("GROUP_TOKEN") or "k1.a.GHSx09IglDrPEe0qC9T-1nRO4OZNX-SrTfzERQa6PSDjwgufKrrSile-Gh38kKSloZGNlxe0YdxRcJnAphHlaUXvMLQDZv9hcRqo5fYQHZVUjYf1YTUZND0xhB8H-oFkYRSlgoyg5O0PQfFD08LjYSqImG8m55jFrZFr0KNtiJtQjHcNQhJ-Rp5ftrmMgWEa728Au7N9V9_SymC5ti-xcw""
 GROUP_ID = 242102423                  # id сообщества-бота (без минуса)
 
 # Сообщество и обсуждение, где лежат ОТЧЁТЫ
@@ -41,12 +44,17 @@ REPORT_GROUP_ID = 221245909           # без минуса
 REPORT_TOPIC_ID = 56568576
 
 # Специальное сообщество, которому страница пишет /список и от которого ждёт ответ с никами
-LIST_GROUP_ID = 241841230                     # <-- ВПИШИ id этого сообщества (без минуса)
+LIST_GROUP_ID = 241841230             # id этого сообщества (без минуса)
 LIST_COMMAND = "/список"
 LIST_WAIT = 30                        # сколько секунд ждать ответ на /список
 LIST_SETTLE = 3                       # ответ может прийти несколькими сообщениями: ждём тишину столько секунд
 
 REQUIRE_SCREENS = False               # True = отчёт засчитывается, только если есть хотя бы 1 скрин
+
+# Нечёткий поиск ников
+FUZZY_RATIO = 0.85     # порог похожести для опечаток (1.0 = только точное совпадение)
+FUZZY_MIN_LEN = 6      # опечатки ищем только у ников длиннее N символов (у коротких слишком много ложных совпадений)
+MAX_JOIN = 4           # сколько слов подряд склеиваем ("ivan petrov" -> "ivanpetrov")
 
 TZ = timezone(timedelta(hours=3))     # МСК
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))     # файлы лежат рядом со скриптом
@@ -269,9 +277,8 @@ def watchdog():
 
 # ---------- поиск ников и пользователей ----------
 def find_nick(text):
-    # ссылки и упоминания (vk.com/anna_s, [id1|Имя]) не считаем никами
+    """Оставлена для совместимости; в проверке отчётов больше не используется."""
     text = MENTION_RE.sub(" ", text or "")
-    # шаблон отчёта "Nick_Name: Real_Nick" -> берём то, что написано после подписи
     m = PLACEHOLDER_AFTER_RE.search(text)
     if m:
         rest = m.group(1)
@@ -281,7 +288,7 @@ def find_nick(text):
         n = re.match(r"\s*([A-Z][A-Za-z0-9]*)\s+([A-Z][A-Za-z0-9]*)", rest)
         if n:
             return f"{n.group(1)}_{n.group(2)}"
-    text = PLACEHOLDER_RE.sub(" ", text)       # сама подпись "Nick_Name" ником не считается
+    text = PLACEHOLDER_RE.sub(" ", text)
     m = NICK_RE.search(text)
     if m:
         return m.group(0)
@@ -302,6 +309,48 @@ def parse_nick_list(text):
             seen.add(nick.lower())
             result.append(nick)
     return result
+
+
+def compact(s):
+    """Ник в сравнимый вид: нижний регистр, без _ пробелов и прочих символов."""
+    return re.sub(r"[^a-z0-9]", "", norm(s))
+
+
+def report_candidates(text):
+    """Все возможные «склейки» слов из текста отчёта: ivan, petrov, ivanpetrov..."""
+    text = MENTION_RE.sub(" ", text or "")
+    text = PLACEHOLDER_RE.sub(" ", text)
+    tokens = re.findall(r"[a-z0-9]+", norm(text))
+    cands = set()
+    for i in range(len(tokens)):
+        s = ""
+        for j in range(i, min(i + MAX_JOIN, len(tokens))):
+            s += tokens[j]
+            cands.add(s)
+    return cands
+
+
+def match_nicks(nicks, cands):
+    """Какие ники из списка встречаются среди candidates (точно или с опечаткой)."""
+    keys = {n: compact(n) for n in nicks}
+    all_keys = set(keys.values())
+    found = set()
+    for nick, k in keys.items():
+        if not k:
+            continue
+        if k in cands:
+            found.add(nick)
+            continue
+        if len(k) < FUZZY_MIN_LEN:
+            continue
+        for c in cands:
+            if abs(len(c) - len(k)) > 2 or c in all_keys:   # c in all_keys: это точный другой ник, не опечатка
+                continue
+            sm = SequenceMatcher(None, c, k)
+            if sm.quick_ratio() >= FUZZY_RATIO and sm.ratio() >= FUZZY_RATIO:
+                found.add(nick)
+                break
+    return found
 
 
 def resolve_user(vk, ref):
@@ -368,17 +417,15 @@ def count_screens(comment):
 
 
 def collect_reports(vk, start_ts, end_ts):
-    """{from_id: {'nicks': set(нижний регистр), 'screens': int}} за [start_ts, end_ts)"""
+    """{from_id: {'cands': set(склейки слов), 'screens': int}} за [start_ts, end_ts)"""
     data = {}
     comments = get_comments(vk, REPORT_GROUP_ID, REPORT_TOPIC_ID, start_ts, end_ts)
     for c in reversed(comments):
         uid = c.get("from_id", 0)
         if uid <= 0:
             continue
-        rec = data.setdefault(uid, {"nicks": set(), "screens": 0})
-        nick = find_nick(c.get("text", ""))
-        if nick:
-            rec["nicks"].add(nick.lower())
+        rec = data.setdefault(uid, {"cands": set(), "screens": 0})
+        rec["cands"] |= report_candidates(c.get("text", ""))
         rec["screens"] += count_screens(c)
     return data, len(comments)
 
@@ -468,10 +515,10 @@ def run_check(vk, my_id, peer, day, month, year):
     for rec in reports.values():
         if REQUIRE_SCREENS and rec["screens"] == 0:
             continue
-        have |= rec["nicks"]
+        have |= match_nicks(nicks, rec["cands"])
 
     # 4) результат
-    lines = [f"{n} есть отчет" if n.lower() in have else f"{n} нет отчета" for n in nicks]
+    lines = [f"{n} есть отчет" if n in have else f"{n} нет отчета" for n in nicks]
     send(vk, peer, "\n".join(lines))
 
 
