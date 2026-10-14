@@ -36,7 +36,10 @@ from vk_api.longpoll import VkLongPoll, VkEventType
 
 # ====================== НАСТРОЙКИ ======================
 # Токен лучше хранить в переменной окружения GROUP_TOKEN (или вписать сюда НОВЫЙ токен)
-GROUP_TOKEN = os.environ.get("GROUP_TOKEN") or "vk1.a.GHSx09IglDrPEe0qC9T-1nRO4OZNX-SrTfzERQa6PSDjwgufKrrSile-Gh38kKSloZGNlxe0YdxRcJnAphHlaUXvMLQDZv9hcRqo5fYQHZVUjYf1YTUZND0xhB8H-oFkYRSlgoyg5O0PQfFD08LjYSqImG8m55jFrZFr0KNtiJtQjHcNQhJ-Rp5ftrmMgWEa728Au7N9V9_SymC5ti-xcw"
+VK_TOKEN = os.environ["VK_TOKEN"]
+if not VK_TOKEN:
+    raise SystemExit("VK_TOKEN пустой: добавьте секрет VK_TOKEN в Settings → Secrets → Actions")
+    
 GROUP_ID = 242102423                  # id сообщества-бота (без минуса)
 
 # Сообщество и обсуждение, где лежат ОТЧЁТЫ
